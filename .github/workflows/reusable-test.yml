@@ -1,0 +1,238 @@
+name: '[Reusable] Data Ingestion Pytest'
+
+on:
+  workflow_call:
+    inputs:
+      ACT_MODE:
+        description: |
+          For running Github Action Workflows locally with Nektos act.
+        required: true
+        type: boolean
+      markers:
+        description: |
+          PyTest markers to select specific tests within Github Action Workflows.
+        required: true
+        type: string
+      working_directory:
+        description: |
+          Working directory containing Terraform test scripts.
+        required: false
+        type: string
+        default: './test'
+
+    secrets:
+      GOOGLE_WORKLOAD_IDENTITY_PROVIDER:
+        description: GCP Workload Identity Provider resource name for GitHub OIDC authentication.
+        required: true
+      GOOGLE_IMPERSONATE_SERVICE_ACCOUNT_EMAIL:
+        description: GCP service account email to impersonate for test execution.
+        required: true
+      TF_API_TOKEN:
+        description: Terraform.io access token.
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  terraform-output:
+    name: Terraform Output
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    outputs:
+      OUTPUT_BUCKET: ${{ steps.tf-raw.outputs.OUTPUT_BUCKET }}
+      GCP_FUNCTION_API_ENDPOINT: ${{ steps.tf-raw.outputs.GCP_FUNCTION_API_ENDPOINT }}
+      INVOKER_SERVICE_ACCOUNT_EMAIL: ${{ steps.tf-raw.outputs.INVOKER_SERVICE_ACCOUNT_EMAIL }}
+      GOOGLE_PROJECT: ${{ steps.tf-raw.outputs.GOOGLE_PROJECT }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        run: terraform init
+
+      - name: terraform raw output
+        id: tf-raw
+        run: |
+          set -euo pipefail
+          output_bucket="$(terraform output -raw bronze_bucket_name)"
+          function_url="$(terraform output -raw function_url)"
+          service_account_email="$(terraform output -raw service_account_email)"
+          project_id="$(terraform output -raw project_id)"
+          {
+            echo "OUTPUT_BUCKET=$output_bucket"
+            echo "GCP_FUNCTION_API_ENDPOINT=$function_url"
+            echo "INVOKER_SERVICE_ACCOUNT_EMAIL=$service_account_email"
+            echo "GOOGLE_PROJECT=$project_id"
+          } >> "$GITHUB_OUTPUT"
+
+  terraform-test:
+    name: Terraform Test
+    needs: [terraform-output]
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}/unit_test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Authenticate to Google Cloud
+        if: ${{ !inputs.ACT_MODE }}
+        id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GOOGLE_IMPERSONATE_SERVICE_ACCOUNT_EMAIL }}
+          token_format: access_token
+          access_token_lifetime: 3600s
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - name: Export Google OAuth access token
+        if: ${{ !inputs.ACT_MODE }}
+        env:
+          OAUTH_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+        run: |
+          set -euo pipefail
+          : "${OAUTH_ACCESS_TOKEN:?OAuth access token is required}"
+          echo "::add-mask::$OAUTH_ACCESS_TOKEN"
+          echo "GOOGLE_OAUTH_ACCESS_TOKEN=$OAUTH_ACCESS_TOKEN" >> "$GITHUB_ENV"
+
+      - name: Setup Terraform for local OAuth access token
+        if: ${{ inputs.ACT_MODE }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+          terraform_wrapper: false
+
+      - name: terraform init for local OAuth access token
+        if: ${{ inputs.ACT_MODE }}
+        working-directory: ${{ inputs.working_directory }}
+        run: terraform init
+
+      - name: Export local Google OAuth access token
+        if: ${{ inputs.ACT_MODE }}
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          set -euo pipefail
+          oauth_access_token="$(terraform output -raw google_oauth_access_token)"
+          : "${oauth_access_token:?OAuth access token is required}"
+          echo "::add-mask::$oauth_access_token"
+          echo "GOOGLE_OAUTH_ACCESS_TOKEN=$oauth_access_token" >> "$GITHUB_ENV"
+
+      - name: Export test environment
+        env:
+          OUTPUT_BUCKET: ${{ needs.terraform-output.outputs.OUTPUT_BUCKET }}
+          GCP_FUNCTION_API_ENDPOINT: ${{ needs.terraform-output.outputs.GCP_FUNCTION_API_ENDPOINT }}
+          INVOKER_SERVICE_ACCOUNT_EMAIL: ${{ needs.terraform-output.outputs.INVOKER_SERVICE_ACCOUNT_EMAIL }}
+          GOOGLE_PROJECT: ${{ needs.terraform-output.outputs.GOOGLE_PROJECT }}
+        run: |
+          set -euo pipefail
+          for name in OUTPUT_BUCKET GCP_FUNCTION_API_ENDPOINT INVOKER_SERVICE_ACCOUNT_EMAIL GOOGLE_PROJECT; do
+            if [[ -z "${!name}" || "${!name}" == *$'\n'* || "${!name}" == *$'\r'* ]]; then
+              echo "::error::Required metadata is empty or invalid: $name"
+              exit 1
+            fi
+          done
+          for name in OUTPUT_BUCKET GCP_FUNCTION_API_ENDPOINT INVOKER_SERVICE_ACCOUNT_EMAIL GOOGLE_PROJECT; do
+            echo "$name=${!name}" >> "$GITHUB_ENV"
+          done
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest google-cloud-storage fsspec gcsfs requests
+
+      - name: Generate shared Google ID token
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from urllib.parse import quote
+
+          import requests
+
+          required = (
+              "GOOGLE_OAUTH_ACCESS_TOKEN", "OUTPUT_BUCKET",
+              "GCP_FUNCTION_API_ENDPOINT", "INVOKER_SERVICE_ACCOUNT_EMAIL",
+              "GOOGLE_PROJECT", "GITHUB_ENV",
+          )
+          for name in required:
+              value = os.environ.get(name, "")
+              if not value.strip() or "\n" in value or "\r" in value:
+                  raise SystemExit(f"Required environment variable is empty or invalid: {name}")
+
+          email = quote(os.environ["INVOKER_SERVICE_ACCOUNT_EMAIL"], safe="@")
+          url = (
+              "https://iamcredentials.googleapis.com/v1/projects/-/"
+              f"serviceAccounts/{email}:generateIdToken"
+          )
+          try:
+              response = requests.post(
+                  url,
+                  headers={"Authorization": f"Bearer {os.environ['GOOGLE_OAUTH_ACCESS_TOKEN']}"},
+                  json={"audience": os.environ["GCP_FUNCTION_API_ENDPOINT"], "includeEmail": True},
+                  timeout=30,
+                  allow_redirects=False,
+              )
+              response.raise_for_status()
+              if response.status_code != 200:
+                  raise SystemExit("IAM Credentials ID-token request did not succeed")
+          except requests.exceptions.RequestException:
+              raise SystemExit("IAM Credentials ID-token request failed") from None
+
+          try:
+              payload = response.json()
+          except ValueError:
+              raise SystemExit("IAM Credentials returned invalid JSON") from None
+          token = payload.get("token") if isinstance(payload, dict) else None
+          if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", token):
+              raise SystemExit("IAM Credentials returned a missing or malformed ID token")
+
+          print(f"::add-mask::{token}", flush=True)
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              env_file.write(f"GOOGLE_ID_TOKEN={token}\n")
+          PY
+
+      - name: Test with pytest
+        env:
+          PYTEST_MARKERS: ${{ inputs.markers }}
+        run: |
+          set -euo pipefail
+          for name in OUTPUT_BUCKET GOOGLE_PROJECT GCP_FUNCTION_API_ENDPOINT GOOGLE_ID_TOKEN GOOGLE_OAUTH_ACCESS_TOKEN; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Required test environment variable is missing: $name"
+              exit 1
+            fi
+          done
+          pytest -m "$PYTEST_MARKERS" \
+            -rs \
+            --doctest-modules \
+            --junitxml=junit/test-results.xml
+
+      - name: Upload pytest test results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results
+          path: ${{ inputs.working_directory }}/unit_test/junit/test-results.xml

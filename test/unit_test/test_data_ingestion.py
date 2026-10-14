@@ -1,94 +1,82 @@
-"""
-Unit Test: HTTP-triggered GCP Function File Upload
+"""Integration Test: HTTP-triggered GCP Function File Upload
 
-This unit test verifies the functionality of GCP Function triggered
-by HTTP requests. The function is expected to receive a
-file upload (in the HTTP request body) and a filename (as a query parameter),
-and write the file to an Google Cloud Store bucket specified by the
-OUTPUT_BUCKET environment variables.
-
-The test sends a sample JSON payload to the function's API endpoint and then
-checks that the file has been correctly written to the storage bucket. This ensures the
-function's API integration and Blob Storage write logic are functioning as intended.
+Uploads a JSON file as multipart form data to a GCP Function and verifies
+the payload written to Google Cloud Storage. HTTP invocation uses an
+audience-specific ID token; storage access uses a short-lived OAuth token.
 
 Environment Variables Required:
  - OUTPUT_BUCKET: Name of the Google Cloud Storage bucket where files will be written.
- - FUNCTION_URL: The HTTP endpoint for the Azure Function.
+ - GOOGLE_PROJECT: Google Cloud project ID used for storage access.
+ - GCP_FUNCTION_API_ENDPOINT: The HTTP endpoint for the GCP Function.
+ - GOOGLE_ID_TOKEN: Audience-specific ID token for HTTP invocation.
+ - GOOGLE_OAUTH_ACCESS_TOKEN: OAuth access token for Google Cloud Storage.
 
-Local Testing Steps:
+Local Testing Steps (from the repository root):
 ```
-cd test
-direnv allow
-
-terraform init && \
-terraform apply -auto-approve
-
-direnv reload
-
-# Ensure you have installed dependencies: pip install pytest requests gcsfs
-python3 -m pytest -m 'local and env'
-
-terraform destroy -auto-approve
+python3 -m pytest test/unit_test -m "local and env" -rs
 ```
+
+See README.md's Local Deployment Testing section for deployment, token
+generation, environment setup, and teardown. Missing configuration skips
+the test rather than failing collection.
 """
 
 import io
 import json
+import logging
 import os
 import uuid
 
 import gcsfs
 import pytest
 import requests
+from google.oauth2.credentials import Credentials
 
-# Environment Variables
-OUTPUT_BUCKET = os.getenv("OUTPUT_BUCKET")
-GOOGLE_PROJECT = os.getenv("GOOGLE_PROJECT")
-GCP_FUNCTION_API_ENDPOINT = os.getenv("GCP_FUNCTION_API_ENDPOINT")
-GCP_FUNCTION_API_OAUTH_KEY = os.getenv("GCP_FUNCTION_API_OAUTH_KEY")
-GOOGLE_OAUTH_ACCESS_TOKEN_IMPERSONATION = os.getenv(
-    "GOOGLE_OAUTH_ACCESS_TOKEN_IMPERSONATION"
-)
+def _required_env(name):
+    value = os.getenv(name)
+    if not value:
+        pytest.skip(f"Required environment variable is not set: {name}")
+    return value
 
-assert OUTPUT_BUCKET is not None
-assert GOOGLE_PROJECT is not None
-assert GCP_FUNCTION_API_ENDPOINT is not None
-assert GCP_FUNCTION_API_OAUTH_KEY is not None
-assert GOOGLE_OAUTH_ACCESS_TOKEN_IMPERSONATION is not None
+
+def _oauth_filesystem_kwargs():
+    return {
+        "project": _required_env("GOOGLE_PROJECT"),
+        "token": Credentials(token=_required_env("GOOGLE_OAUTH_ACCESS_TOKEN")),
+    }
+
+
+def _upload_file(endpoint, id_token, filename, payload):
+    response = requests.post(
+        url=endpoint,
+        headers={"Authorization": f"Bearer {id_token}"},
+        files=[("files", (filename, io.BytesIO(json.dumps(payload).encode("utf-8"))))],
+    )
+    assert response.status_code == 200, f"Function HTTP call failed: {response.text}"
+
+
+def _read_blob(fs, path):
+    with fs.open(path, "rb") as file:
+        return json.loads(file.read())
+
+
+def _verify_function_file_upload(payload, **filesystem_kwargs):
+    endpoint = _required_env("GCP_FUNCTION_API_ENDPOINT")
+    id_token = _required_env("GOOGLE_ID_TOKEN")
+    bucket_name = _required_env("OUTPUT_BUCKET")
+    filename = f"test-env-{uuid.uuid4()}.json"
+
+    _upload_file(endpoint, id_token, filename, payload)
+
+    fs = gcsfs.GCSFileSystem(**filesystem_kwargs)
+    result = _read_blob(fs, f"gs://{bucket_name}/{filename}")
+    assert result["test_value"] == payload["test_value"]
 
 
 @pytest.mark.local
 @pytest.mark.env
 def test_gcp_env_http_function_file_upload(payload=None):
-    """
-    Test uploading a file to the GCP Function via HTTP POST and verifying it's written to Blob Storage.
-    Uses storage account key from environment for access.
-
-    Args:
-        payload (dict, optional): The JSON payload to upload. If None, a random payload is generated.
-    """
     logging.info("Pytest | Test HTTP Function File Upload with Environment Credentials")
-    if payload is None:
-        payload = {"test_value": str(uuid.uuid4())}
+    payload = payload or {"test_value": str(uuid.uuid4())}
 
-    filename = f"test-env-{str(uuid.uuid4())}.json"
-
-    # Send HTTP POST to Azure Function
-    response = requests.post(
-        url=GCP_FUNCTION_API_ENDPOINT,
-        headers={"Authorization": f"Bearer {GCP_FUNCTION_API_OAUTH_KEY}"},
-        files=[("files", (filename, io.BytesIO(json.dumps(payload).encode("utf-8"))))],
-    )
-
-    assert response.status_code == 200, f"Function HTTP call failed: {response.text}"
-
-    # Verify the file was written to Blob Storage
-    fs = gcsfs.GCSFileSystem(
-        project=GOOGLE_PROJECT, token=GOOGLE_OAUTH_ACCESS_TOKEN_IMPERSONATION
-    )
-    with fs.open(
-        os.path.join(f"gs://{OUTPUT_BUCKET}", filename),
-        "r",
-    ) as f:
-        rs = json.load(f)
-        assert rs["test_value"] == payload["test_value"]
+    _verify_function_file_upload(payload, **_oauth_filesystem_kwargs())

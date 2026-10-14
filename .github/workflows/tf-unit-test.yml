@@ -1,0 +1,14 @@
+name: 'Terraform Unit Tests'
+
+on:
+  push:
+
+jobs:
+  terraform-unit-tests:
+    uses: openvers/github-workflows-reusable/.github/workflows/tf-unit-test.yml@GCPv1
+    name: 'Terraform Unit Tests'
+    secrets: inherit
+    with:
+      ACT_MODE: ${{ !!github.event.act }}
+      SKIP_CHECKS: CKV_GCP_41,CKV_GCP_49
+    

@@ -54,7 +54,7 @@ def run(event):
             )
             with fs.open(
                 os.path.join(f"gs://{OUTPUT_BUCKET}", secure_filename(file.filename)),
-                "w",
+                "wb",
             ) as f:
                 file.save(f)
 

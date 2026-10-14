@@ -3,6 +3,11 @@ output "service_account_email" {
   value       = module.service_account_auth.service_account_email
 }
 
+output "project_id" {
+  description = "Google Cloud project ID for ingestion tests"
+  value       = data.google_project.this.project_id
+}
+
 output "bronze_bucket_name" {
   description = "The bronze bucket name."
   value       = module.data_lake.bronze_bucket_name
@@ -41,4 +46,15 @@ output "gcs_function_object_name" {
 output "gcs_function_object_url" {
   description = "GCS Function URL for Source Code Zip Blob"
   value       = module.gcp_cloud_function.gcs_function_object_url
+}
+
+output "google_service_account" {
+  description = "Newly created GCP Service Account"
+  value       = module.service_account_auth.service_account_email
+}
+
+output "google_oauth_access_token" {
+  description = "Service Account OAuth Access Token"
+  value       = module.service_account_auth.access_token
+  sensitive   = true
 }

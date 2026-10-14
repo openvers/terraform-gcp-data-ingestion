@@ -42,14 +42,16 @@ data "google_project" "this" {
 }
 
 locals {
-  suffix = "test-${random_string.this.result}"
+  pool_id                          = var.WORKLOAD_IDENTITY_POOL_ID
+  wif_provider_attribute_condition = "assertion.repository_owner == '${var.GITHUB_REPOSITORY_OWNER}'"
+
   principal_roles = [
     {
-      principal = "principal://iam.googleapis.com/projects/${data.google_project.this.number}/locations/global/workloadIdentityPools/${var.POOL_ID}/subject/repo:${var.GITHUB_REPOSITORY}:ref:${var.GITHUB_REF}",
+      principal = "principal://iam.googleapis.com/projects/${data.google_project.this.number}/locations/global/workloadIdentityPools/${local.pool_id}/subject/repo:${var.GITHUB_REPOSITORY}:ref:${var.GITHUB_REF}",
       role      = "roles/iam.workloadIdentityUser"
     },
     {
-      principal = "principal://iam.googleapis.com/projects/${data.google_project.this.number}/locations/global/workloadIdentityPools/${var.POOL_ID}/subject/repo:${var.GITHUB_REPOSITORY}:environment:${var.GITHUB_ENV}",
+      principal = "principal://iam.googleapis.com/projects/${data.google_project.this.number}/locations/global/workloadIdentityPools/${local.pool_id}/subject/repo:${var.GITHUB_REPOSITORY}:environment:${var.GITHUB_ENV}",
       role      = "roles/iam.workloadIdentityUser"
     },
   ]
@@ -75,19 +77,19 @@ provider "google" {
 ## - `new_service_account_name`: New service account name.
 ##---------------------------------------------------------------------------------------------------------------------
 module "service_account_auth" {
-  source = "github.com/openvers/terraform-gcp-service-account.git?ref=5645d79241069640d425010dbf0cf11785a03da7"
+  source = "github.com/openvers/terraform-gcp-service-account.git?ref=9e9c63bd03b7dd24af95527e3b84076e3e7248fa"
 
   IMPERSONATE_SERVICE_ACCOUNT_EMAIL = var.IMPERSONATE_SERVICE_ACCOUNT_EMAIL
-  new_service_account_name          = "tf-service-account-${local.suffix}"
+  new_service_account_name          = var.new_service_account_name
   roles_list = [
+    "roles/cloudfunctions.admin",
+    "roles/logging.logWriter",
+    "roles/artifactregistry.admin",
     "roles/storage.admin",
     "roles/cloudkms.admin",
     "roles/iam.serviceAccountUser",
     "roles/iam.serviceAccountAdmin",
-    "roles/cloudfunctions.admin",
-    "roles/logging.logWriter",
-    "roles/artifactregistry.writer",
-    "roles/run.builder"
+    "roles/iam.workloadIdentityPoolAdmin",
   ]
 
   providers = {
@@ -107,6 +109,10 @@ provider "google" {
   alias        = "auth_session"
   access_token = module.service_account_auth.access_token
   project      = data.google_project.this.project_id
+  scopes = [
+    "https://googleapis.com",
+    "https://www.googleapis.com/auth/userinfo.email" # Force email inclusion
+  ]
 }
 
 ##---------------------------------------------------------------------------------------------------------------------
@@ -121,18 +127,31 @@ provider "google" {
 ## - `prinicpal_roles`: List of objects defining WIF prinicpals and impersonating roles.
 ## - `service_account_id`: New service account ID.
 ##---------------------------------------------------------------------------------------------------------------------
-module "workload_identity_federation_principals" {
-  source = "github.com/openvers/terraform-gcp-service-account.git//modules/workflow_identity_federation_principal?ref=5645d79241069640d425010dbf0cf11785a03da7"
+module "workload_identity_federation" {
+  source = "github.com/openvers/terraform-gcp-service-account.git//modules/workflow_identity_federation?ref=9e9c63bd03b7dd24af95527e3b84076e3e7248fa"
 
-  project_number     = data.google_project.this.number
-  pool_id            = var.POOL_ID
-  provider_id        = var.PROVIDER_ID
-  principal_roles    = local.principal_roles
-  service_account_id = module.service_account_auth.service_account_id
+  pool_id                      = var.WORKLOAD_IDENTITY_POOL_ID
+  provider_id                  = var.workload_identity_provider_id
+  provider_attribute_condition = local.wif_provider_attribute_condition
+  principal_roles              = local.principal_roles
+  service_account_id           = module.service_account_auth.service_account_id
 
   providers = {
     google.auth_session = google.auth_session
   }
+}
+
+# Access-token identities need explicit permission to mint the invoker's ID token.
+resource "google_service_account_iam_member" "function_id_token_creator" {
+  provider = google.auth_session
+  for_each = {
+    act    = module.service_account_auth.service_account_email
+    github = var.IMPERSONATE_SERVICE_ACCOUNT_EMAIL
+  }
+
+  service_account_id = module.service_account_auth.service_account_id
+  role               = "roles/iam.serviceAccountOpenIdTokenCreator"
+  member             = "serviceAccount:${each.value}"
 }
 
 
@@ -149,14 +168,14 @@ module "workload_identity_federation_principals" {
 ## - `kms_key_name`: Name of the KMS key.
 ##---------------------------------------------------------------------------------------------------------------------
 module "data_lake" {
-  source     = "github.com/openvers/terraform-gcp-data-lake.git?ref=6a1fb77f16aa1616fb0428c4914f4e822083c3fd"
+  source     = "github.com/openvers/terraform-gcp-data-lake.git?ref=c8c9270288aba3cb9e40ada10f7fcb8dbd52475c"
   depends_on = [module.service_account_auth]
 
-  bronze_bucket_name = "test-bronze-bucket-${local.suffix}"
-  silver_bucket_name = "test-silver-bucket-${local.suffix}"
-  gold_bucket_name   = "test-gold-bucket-${local.suffix}"
-  kms_key_ring_name  = "test-key-ring-${local.suffix}"
-  kms_key_name       = "test-data-lake-key-${local.suffix}"
+  bronze_bucket_name = "test-bronze-bucket-${random_string.this.result}"
+  silver_bucket_name = "test-silver-bucket-${random_string.this.result}"
+  gold_bucket_name   = "test-gold-bucket-${random_string.this.result}"
+  kms_key_ring_name  = "test-key-ring-${random_string.this.result}"
+  kms_key_name       = "test-data-lake-key-${random_string.this.result}"
 
   providers = {
     google.auth_session = google.auth_session
@@ -171,7 +190,6 @@ module "data_lake" {
 ##
 ## Parameters:
 ## - `function_name`: GCP Cloud Function name
-## - `function_service_account_email`: Recently providioned service account email
 ## - `function_service_account_member`: Recently providioned service account member ID
 ## - `function_entrypoint`: Function name to run from source code on blob trigger
 ## - `target_bucket_name`: GCS Bucket to create and configure the Cloud Function to trigger on
@@ -187,11 +205,11 @@ module "gcp_cloud_function" {
     module.data_lake
   ]
 
-  function_name                  = "example-cloud-function-${local.suffix}"
+  function_name                  = "example-cloud-function-${random_string.this.result}"
   function_description           = "Example GCP Data Ingestion Cloud Function"
-  function_bucket_name           = "example-cloud-function-source-${local.suffix}"
-  google_kms_crypto_key_id       = module.data_lake.google_kms_crypto_key_id
   function_service_account_email = module.service_account_auth.service_account_email
+  function_bucket_name           = "example-cloud-function-source-${random_string.this.result}"
+  google_kms_crypto_key_id       = module.data_lake.google_kms_crypto_key_id
   function_entrypoint            = "run"
   function_contents = [
     {

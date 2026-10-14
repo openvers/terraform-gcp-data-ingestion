@@ -1,0 +1,5 @@
+new_service_account_name = "data-ingestion-service-account"
+GITHUB_REPOSITORY_OWNER  = "openvers"
+GITHUB_REPOSITORY        = "openvers/terraform-gcp-data-ingestion"
+GITHUB_REF               = "refs/heads/main"
+GITHUB_ENV               = "production"

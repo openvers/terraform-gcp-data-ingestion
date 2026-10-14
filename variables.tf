@@ -13,11 +13,6 @@ variable "function_description" {
   description = "GCP Function Pipeline Description"
 }
 
-variable "function_service_account_email" {
-  type        = string
-  description = "GCP Service Account Email (pre-strapped with required Project IAM Role Bindings)"
-}
-
 variable "function_bucket_name" {
   type        = string
   description = "GCS Function Source Bucket Name"
@@ -39,6 +34,11 @@ variable "function_contents" {
 variable "function_entrypoint" {
   type        = string
   description = "Function to Run from Source Code Once Triggered"
+}
+
+variable "function_service_account_email" {
+  type        = string
+  description = "Google Service Account to Bind IAM Role Access"
 }
 
 ## ---------------------------------------------------------------------------------------------------------------------
@@ -74,4 +74,16 @@ variable "function_location" {
   type        = string
   description = "Google Cloud Function Region"
   default     = "us-east1"
+}
+
+variable "function_max_instance_count" {
+  type        = number
+  description = "Maximum number of instances for the function"
+  default     = 1
+}
+
+variable "bearer_token_members" {
+    type        = list(string)
+    description = "List of user/service account emails"
+    default     = []
 }
