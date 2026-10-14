@@ -36,13 +36,13 @@ variable "workload_identity_provider_id" {
 variable "GITHUB_REPOSITORY_OWNER" {
   type        = string
   description = "Github Actions Default ENV Variable for the Repo Owner"
-  default     = "sim-parables"
+  default     = "openvers"
 }
 
 variable "GITHUB_REPOSITORY" {
   type        = string
   description = "Github Actions Default ENV Variable for the Repo Path"
-  default     = "sim-parables/terraform-gcp-blob-trigger"
+  default     = "openvers-parables/terraform-gcp-data-ingestion"
 }
 
 variable "GITHUB_REF" {
